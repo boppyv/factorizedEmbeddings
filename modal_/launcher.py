@@ -30,37 +30,34 @@ def train_run(
     embedding_K: int = 64,
     seed: int = 42,
     wandb_run_name: str = "run",
+    max_iters: int = 600000,
+    eval_interval: int = 2000,
 ):
     import subprocess
 
-    # Clone your repo fresh each time (or cache it in a volume later)
     subprocess.run([
         "git", "clone", "https://github.com/boppyv/factorizedEmbeddings.git",
         "/root/project"
     ], check=True)
     os.chdir("/root/project")
 
-    # Symlink data from the persistent volume
-    os.makedirs("data/shakespeare", exist_ok=True)
-    # (for now — later swap to openwebtext)
+    os.makedirs("data/openwebtext", exist_ok=True)
+    if not os.path.exists("data/openwebtext/train.bin"):
+        os.symlink("/data/train.bin", "data/openwebtext/train.bin")
+        os.symlink("/data/val.bin", "data/openwebtext/val.bin")
 
-    # Run training with command-line overrides, same as local
     subprocess.run([
         "python", "train.py",
         f"--embedding_type={embedding_type}",
         f"--embedding_K={embedding_K}",
+        f"--dataset=openwebtext",
+        f"--max_iters={max_iters}",
+        f"--eval_interval={eval_interval}",
         f"--wandb_log=True",
         f"--wandb_project=embedding-sharing",
         f"--wandb_run_name={wandb_run_name}",
         "--compile=True",
     ], check=True)
-
-    # Copy checkpoint to persistent storage
-    run_name = f"{embedding_type}_K{embedding_K}_seed{seed}"
-    subprocess.run(["cp", "-r", "out/", f"/results/{run_name}/"], check=True)
-    results_volume.commit()
-    print(f"Run {run_name} complete")
-
 
 @app.local_entrypoint()
 def main(

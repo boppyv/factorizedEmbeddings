@@ -218,7 +218,8 @@ model.to(device)
 bucket_tensor = torch.tensor(bucket_assignment, dtype=torch.long, device=device)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
-scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
+scaler = torch.amp.GradScaler('cuda', enabled=(dtype == 'float16'))
+
 
 # optimizer
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
@@ -333,12 +334,17 @@ while True:
         print(f"  bucketed: {bucket_str}")
         print(f"  macro={bucket_losses['macro']:.4f}")
         # --- embedding diagnostics ---
-        if embedding_type == 'standard':
-            emb_matrix = raw_model.transformer.wte.embedding.weight.data
+        eff_rank = 0.0
+        emb = raw_model.transformer.wte
+        if hasattr(emb, 'get_embedding_matrix'):
+            emb_matrix = emb.get_embedding_matrix()
+        elif hasattr(emb, 'embedding'):
+            emb_matrix = emb.embedding.weight.data
         else:
-            emb_matrix = raw_model.transformer.wte.get_embedding_matrix()
-        eff_rank = effective_rank(emb_matrix)
-        print(f"  effective_rank={eff_rank:.1f}")
+            emb_matrix = None
+        if emb_matrix is not None:
+            eff_rank = effective_rank(emb_matrix)
+            print(f"  effective_rank={eff_rank:.1f}")
         if wandb_log:
             log_dict = {
                 "iter": iter_num,
@@ -403,12 +409,15 @@ while True:
         scaler.scale(loss).backward()
     # log per-bucket embedding gradient norms (only at eval intervals to limit overhead)
     if iter_num % eval_interval == 0 and master_process:
-        wte = raw_model.transformer.wte.weight
-        if embedding_type == 'standard':
-          wte = raw_model.transformer.wte.embedding.weight
-        else:
-          wte = raw_model.transformer.wte.A.weight  # the per-token parameter
-        if wte.grad is not None:
+        wte = None
+        emb = raw_model.transformer.wte
+        if hasattr(emb, 'embedding'):       # standard
+            wte = emb.embedding.weight
+        elif hasattr(emb, 'generator'):     # progressive
+            wte = emb.generator.A.weight
+        elif hasattr(emb, 'A'):            # factorized, generator, growing
+            wte = emb.A.weight
+        if wte is not None and wte.grad is not None:
             grad = wte.grad.detach()
             grad_norms = {}
             for b in range(num_buckets):
