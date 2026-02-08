@@ -1,0 +1,1 @@
+/Users/thabaptiser/Documents/GitHub/dotfiles/nvim_config/init.vim

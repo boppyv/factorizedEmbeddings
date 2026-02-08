@@ -24,11 +24,18 @@ from contextlib import nullcontext
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
+from evaluation.frequency import build_target_frequency_map, assign_buckets_percentile
+from evaluation.diagnostics import effective_rank
 
+# embedding
+embedding_type = 'standard'
+embedding_K = 64
+weight_tying = True
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
@@ -72,6 +79,8 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
+# frequency bucketing
+num_buckets = 5 # number of frequency-stratified evaluation buckets
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -143,6 +152,17 @@ if os.path.exists(meta_path):
     meta_vocab_size = meta['vocab_size']
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
+# --- frequency bucketing setup ---
+vocab_size_for_buckets = meta_vocab_size if meta_vocab_size is not None else 50304
+target_counts = build_target_frequency_map(os.path.join(data_dir, 'train.bin'), vocab_size_for_buckets)
+bucket_assignment, bucket_stats = assign_buckets_percentile(target_counts, num_buckets=num_buckets)
+bucket_tensor = None  # moved to device later
+if master_process:
+    print(f"Frequency buckets: {num_buckets} buckets across {(target_counts > 0).sum()} active token types")
+    for b in range(num_buckets):
+        s = bucket_stats[b]
+        print(f"  Bucket {b}: {s['num_types']} types, freq range {s['freq_range']}")
+
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
@@ -153,7 +173,8 @@ if init_from == 'scratch':
     if meta_vocab_size is None:
         print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
-    gptconf = GPTConfig(**model_args)
+    gptconf = GPTConfig(**model_args, embedding_type=embedding_type, embedding_K=embedding_K, weight_tying=weight_tying)
+
     model = GPT(gptconf)
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
@@ -166,7 +187,8 @@ elif init_from == 'resume':
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = checkpoint_model_args[k]
     # create the model
-    gptconf = GPTConfig(**model_args)
+    gptconf = GPTConfig(**model_args, embedding_type=embedding_type, embedding_K=embedding_K, weight_tying=weight_tying)
+
     model = GPT(gptconf)
     state_dict = checkpoint['model']
     # fix the keys of the state dictionary :(
@@ -191,6 +213,9 @@ if block_size < model.config.block_size:
     model.crop_block_size(block_size)
     model_args['block_size'] = block_size # so that the checkpoint will have the right value
 model.to(device)
+
+# move bucket assignments to same device as model
+bucket_tensor = torch.tensor(bucket_assignment, dtype=torch.long, device=device)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
@@ -221,11 +246,48 @@ def estimate_loss():
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
-                logits, loss = model(X, Y)
+                logits, loss = model(X, Y, iter_num)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
     return out
+
+@torch.no_grad()
+def estimate_bucketed_loss():
+    """Compute per-frequency-bucket validation loss."""
+    model.eval()
+    bucket_loss_sums = torch.zeros(num_buckets, device=device)
+    bucket_count = torch.zeros(num_buckets, device=device)
+    for k in range(eval_iters):
+        X, Y = get_batch('val')
+        with ctx:
+            logits, loss = model(X, Y, iter_num)
+        # per-token unreduced loss
+        B, T, V = logits.shape
+        per_token_loss = F.cross_entropy(
+            logits.view(B * T, V),
+            Y.view(B * T),
+            reduction='none'
+        )
+        target_buckets = bucket_tensor[Y.view(-1)]
+        for b in range(num_buckets):
+            mask = (target_buckets == b)
+            count = mask.sum()
+            if count > 0:
+                bucket_loss_sums[b] += per_token_loss[mask].sum()
+                bucket_count[b] += count
+    # compute averages
+    bucket_losses = {}
+    for b in range(num_buckets):
+        if bucket_count[b] > 0:
+            bucket_losses[b] = (bucket_loss_sums[b] / bucket_count[b]).item()
+        else:
+            bucket_losses[b] = float('nan')
+    # macro loss: equal weight per bucket
+    valid = [l for l in bucket_losses.values() if l == l]  # filter NaN
+    bucket_losses['macro'] = sum(valid) / len(valid) if valid else float('nan')
+    model.train()
+    return bucket_losses
 
 # learning rate decay scheduler (cosine with warmup)
 def get_lr(it):
@@ -245,6 +307,8 @@ def get_lr(it):
 if wandb_log and master_process:
     import wandb
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+    wandb.define_metric("iter")
+    wandb.define_metric("*", step_metric="iter")
 
 # training loop
 X, Y = get_batch('train') # fetch the very first batch
@@ -263,14 +327,31 @@ while True:
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        # --- bucketed evaluation ---
+        bucket_losses = estimate_bucketed_loss()
+        bucket_str = " | ".join(f"b{b}={bucket_losses[b]:.4f}" for b in range(num_buckets))
+        print(f"  bucketed: {bucket_str}")
+        print(f"  macro={bucket_losses['macro']:.4f}")
+        # --- embedding diagnostics ---
+        if embedding_type == 'standard':
+            emb_matrix = raw_model.transformer.wte.embedding.weight.data
+        else:
+            emb_matrix = raw_model.transformer.wte.get_embedding_matrix()
+        eff_rank = effective_rank(emb_matrix)
+        print(f"  effective_rank={eff_rank:.1f}")
         if wandb_log:
-            wandb.log({
+            log_dict = {
                 "iter": iter_num,
                 "train/loss": losses['train'],
                 "val/loss": losses['val'],
+                "val/macro_loss": bucket_losses['macro'],
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
-            })
+                "embed/effective_rank": eff_rank,
+            }
+            for b in range(num_buckets):
+                log_dict[f"val/loss_bucket_{b}"] = bucket_losses[b]
+            wandb.log(log_dict)
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:
@@ -286,6 +367,23 @@ while True:
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
     if iter_num == 0 and eval_only:
         break
+    if hasattr(raw_model.transformer.wte, 'grow'):
+        # grow at 33% and 66% of training
+        growth_schedule = {
+            int(max_iters * 0.33): 32,
+            int(max_iters * 0.66): 64,
+        }
+        if iter_num in growth_schedule:
+            new_K = growth_schedule[iter_num]
+            if raw_model.transformer.wte.grow(new_K):
+                print(f"Grew K to {new_K} at step {iter_num}")
+                # must reinitialize optimizer — parameter tensors changed
+                optimizer = raw_model.configure_optimizers(
+                    weight_decay, learning_rate, (beta1, beta2), device_type
+                )
+                # also recompile if using torch.compile
+                if compile:
+                    model = torch.compile(raw_model)
 
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
@@ -297,12 +395,33 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(X, Y)
+            logits, loss = model(X, Y, iter_num)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
+    # log per-bucket embedding gradient norms (only at eval intervals to limit overhead)
+    if iter_num % eval_interval == 0 and master_process:
+        wte = raw_model.transformer.wte.weight
+        if embedding_type == 'standard':
+          wte = raw_model.transformer.wte.embedding.weight
+        else:
+          wte = raw_model.transformer.wte.A.weight  # the per-token parameter
+        if wte.grad is not None:
+            grad = wte.grad.detach()
+            grad_norms = {}
+            for b in range(num_buckets):
+                mask = (bucket_tensor[:grad.shape[0]] == b)
+                if mask.any():
+                    grad_norms[b] = grad[mask].norm(dim=1).mean().item()
+                else:
+                    grad_norms[b] = 0.0
+            if wandb_log:
+                for b in range(num_buckets):
+                    wandb.log({f"embed/grad_norm_bucket_{b}": grad_norms[b]}, step=iter_num)
+            grad_str = " | ".join(f"b{b}={grad_norms[b]:.4e}" for b in range(num_buckets))
+            print(f"  embed grad norms: {grad_str}")
     # clip the gradient
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
