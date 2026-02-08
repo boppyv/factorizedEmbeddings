@@ -19,7 +19,7 @@ image = (
 app = modal.App("embedding-experiments")
 
 @app.function(
-    gpu="H100",
+    gpu="A100",
     image=image,
     volumes={"/data": volume, "/results": results_volume},
     secrets=[modal.Secret.from_name("wandb-secret")],
