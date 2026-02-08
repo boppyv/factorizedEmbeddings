@@ -1,28 +1,20 @@
 # modal_/phase3.py
 from modal_.launcher import train_run, app
 
-SEEDS = [42, 123, 456]
-
-EXPERIMENTS = [
-    {"embedding_type": "standard", "embedding_K": 64},
-    {"embedding_type": "factorized", "embedding_K": 64},
-    {"embedding_type": "progressive", "embedding_K": 64},
-]
-
 @app.local_entrypoint()
-def main():
-    futures = []
-    for cfg in EXPERIMENTS:
-        for seed in SEEDS:
-            name = f"{cfg['embedding_type']}_K{cfg['embedding_K']}_seed{seed}"
-            futures.append(train_run.spawn(
-                embedding_type=cfg["embedding_type"],
-                embedding_K=cfg["embedding_K"],
-                seed=seed,
-                wandb_run_name=name,
-            ))
-            print(f"Launched: {name}")
+def main_phase3():
+    embedding_types = []
+    embedding_Ks = []
+    seeds = []
+    names = []
 
-    print(f"\n{len(futures)} runs launched on separate A100s.")
-    print("All runs use .spawn() — safe to close your terminal.")
-    print("Monitor progress at https://wandb.ai and https://modal.com")
+    for emb_type in ["standard", "factorized", "generator", "progressive"]:
+        for seed in [42, 123, 456]:
+            embedding_types.append(emb_type)
+            embedding_Ks.append(64)
+            seeds.append(seed)
+            names.append(f"{emb_type}_K64_seed{seed}_phase3")
+
+    print(f"Launching {len(names)} runs...")
+    train_run.spawn_map(embedding_types, embedding_Ks, seeds, names)
+    print("All runs submitted. Safe to close terminal.")

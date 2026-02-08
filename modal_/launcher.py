@@ -19,7 +19,7 @@ image = (
 app = modal.App("embedding-experiments")
 
 @app.function(
-    gpu="A100",
+    gpu="H100",
     image=image,
     volumes={"/data": volume, "/results": results_volume},
     secrets=[modal.Secret.from_name("wandb-secret")],
@@ -51,12 +51,17 @@ def train_run(
         f"--embedding_type={embedding_type}",
         f"--embedding_K={embedding_K}",
         f"--dataset=openwebtext",
-        f"--max_iters={max_iters}",
-        f"--eval_interval={eval_interval}",
         f"--wandb_log=True",
         f"--wandb_project=embedding-sharing",
         f"--wandb_run_name={wandb_run_name}",
         "--compile=True",
+        
+        # single-GPU training settings
+        "--gradient_accumulation_steps=5",
+        "--max_iters=50000",
+        "--lr_decay_iters=50000",
+        "--warmup_iters=500",
+        "--eval_interval=1000",
     ], check=True)
 
 @app.local_entrypoint()
